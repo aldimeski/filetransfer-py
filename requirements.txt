@@ -1,0 +1,2 @@
+# Only needed for SFTP jobs (SftpCheck:Y). Everything else is the Python standard library.
+paramiko>=3.0

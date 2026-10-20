@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+# real job files, backups made by convert-param.py and secrets (only examples/ is published)
+*.param_perl
+*.pass
+*.key
+*.log
+/param/
