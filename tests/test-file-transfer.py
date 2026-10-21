@@ -341,24 +341,41 @@ class LocalTransferTests(JobTestCase):
         self.assertEqual(code, 1)
         self.assertEqual(sent[0], ("smtp.x", 25))
         self.assertEqual(sent[1][1], ["b@x.at", "c@x.at", "d@x.at"])
+        host = ft.socket.getfqdn() or ft.socket.gethostname()
+        self.assertIn(f"on {host}", sent[1][0])  # subject names the machine
+        text = self.decoded_mail(sent[1][2])
+        self.assertIn(f"Script ran on server: {host}", text)
+        self.assertIn("Transfer: local transfer", text)
+        self.assertIn(self.path("job.param"), text)
+        self.assertIn("InputDir does not exist", text)
+
+    def decoded_mail(self, raw):
+        import email
+        message = email.message_from_string(raw)
+        return "".join(part.get_payload(decode=True).decode("utf-8") for part in message.walk()
+                       if part.get_content_type() == "text/html")
 
 
 class FakeEntry:
-    def __init__(self, entry):
-        info = entry.stat()
-        self.filename, self.st_mode, self.st_size, self.st_mtime = entry.name, info.st_mode, info.st_size, info.st_mtime
+    """Like paramiko's SFTPAttributes from listdir_attr: describes a link itself, not its target."""
+
+    def __init__(self, name, info):
+        self.filename, self.st_mode, self.st_size, self.st_mtime = name, info.st_mode, info.st_size, info.st_mtime
 
 
 class FakeSftpChannel:
     """Maps 'remote' paths straight onto the local file system."""
 
     def listdir_attr(self, path):
-        return [FakeEntry(entry) for entry in os.scandir(path)]
+        # some servers also list "." and ".."
+        entries = [FakeEntry(name, os.lstat(os.path.join(path, name))) for name in (".", "..")]
+        entries += [FakeEntry(entry.name, entry.stat(follow_symlinks=False)) for entry in os.scandir(path)]
+        return entries
 
-    def stat(self, path):
+    def stat(self, path):  # follows links, like the real thing
         try:
-            return FakeEntry(next(e for e in os.scandir(os.path.dirname(path)) if e.name == os.path.basename(path)))
-        except StopIteration:
+            return FakeEntry(os.path.basename(path), os.stat(path))
+        except OSError:
             raise IOError("no such file")
 
     def get(self, remote, local):
@@ -421,6 +438,52 @@ class SftpTransferTests(JobTestCase):
         self.assertEqual(code, 0, self.err)
         self.assertEqual(FakeSSHClient.connected_with["password"], "s3cret")
         self.assertEqual(self.listing("out"), ["DR_P11_a.dat", "DR_P11_b.dat"])
+
+    def test_dots_directories_and_links_are_never_downloaded(self):
+        self.put("DR_P11_a.dat", b"real")
+        os.makedirs(self.path("in", "dwh_in"))
+        os.makedirs(self.path("in", "out"))
+        with open(self.path("elsewhere.dat"), "w") as handle:
+            handle.write("target outside the input folder")
+        os.symlink(self.path("elsewhere.dat"), self.path("in", "DR_P11_link.dat"))  # link to a file: allowed
+        os.symlink("out", self.path("in", "DR_P11_dirlink"))            # link to a directory: skipped
+        os.symlink("/nonexistent", self.path("in", "DR_P11_broken"))    # broken link: skipped
+        code = self.sftp_job(KeepInput="N", FileMask=".*")  # a mask that also matches ".", ".." and folder names
+        self.assertEqual(code, 0, self.err)
+        self.assertEqual(self.err.count("ERROR"), 0)
+        self.assertEqual(self.listing("out"), ["DR_P11_a.dat", "DR_P11_link.dat"])
+        self.assertEqual(self.listing("in"), ["DR_P11_broken", "DR_P11_dirlink", "dwh_in", "out"])  # folders untouched
+        self.assertNotIn("/..", self.log_text())
+
+    def test_listing_has_only_regular_files(self):
+        self.put("a.dat")
+        self.put("sub/b.dat")
+        os.makedirs(self.path("in", "emptydir"))
+        source = ft.SftpSource.__new__(ft.SftpSource)  # skip the connection, only the listing is tested
+        source._sftp = FakeSftpChannel()
+        names = lambda recursive: sorted(f.name for f in source.list_files(self.path("in") + "/", recursive))
+        self.assertEqual(names(False), ["a.dat"])
+        self.assertEqual(names(True), ["a.dat", "b.dat"])
+
+    def test_error_mail_names_the_sftp_server(self):
+        sent = []
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=None): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def send_message(self, message, to_addrs=None): sent.append(message)
+
+        original = ft.smtplib.SMTP
+        ft.smtplib.SMTP = FakeSMTP
+        self.addCleanup(setattr, ft.smtplib, "SMTP", original)
+        self.put("DR_P11_a.dat")
+        code = self.sftp_job(SftpKey=self.path("missing"), SftpHost="sftp.example.test", SftpUser="svc", Notification="Y",
+                             NotificationSender="a@x.at", NotificationRe="b@x.at", NotificationServer="smtp.x")
+        self.assertEqual(code, 1)
+        text = sent[0].get_payload()[0].get_payload(decode=True).decode("utf-8")
+        self.assertIn("Transfer: SFTP from server sftp.example.test:22 (user svc)", text)
+        self.assertIn("Script ran on server:", text)
 
     def test_missing_key_file_reports_error(self):
         self.put("DR_P11_a.dat")

@@ -34,6 +34,17 @@
 - Control files (`CtlFileExtension`) are never transferred as data files.
 - Files are downloaded once from SFTP even with several output directories.
 
+## Error e-mail
+
+Subject: `Automatic Mail from : File transfer with param <param file> on <host>`. The body starts with
+`Script ran on server: <host>`, `Transfer: SFTP from server <host>:<port> (user <user>)` (or `local transfer`),
+the param file and the input/output directories, followed by the errors.
+
+## SFTP listing
+
+Only regular files are returned. `.` and `..` are ignored, directories are entered only with
+`SubDirCheck:Y`, symlinks to regular files are followed, links to directories and broken links are skipped.
+
 ## Optional parameters added
 
 | Parameter | Default | Meaning |

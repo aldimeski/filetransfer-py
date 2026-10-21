@@ -24,6 +24,7 @@ import posixpath
 import re
 import shutil
 import smtplib
+import socket
 import stat
 import sys
 import tempfile
@@ -34,7 +35,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Dict, List, Optional, Set, Tuple
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 PARAM_SUFFIX = ".param"
 TMP_PREFIX = "tmp_"  # downstream readers must ignore files with this prefix
 RANGE_SEPARATOR = re.compile(r"&date", re.IGNORECASE)
@@ -522,12 +523,24 @@ class SftpSource:
             except IOError as exc:
                 raise TransferError(f"Cannot list {directory} on SFTP: {exc}")
             for entry in sorted(entries, key=lambda item: item.filename):
+                if entry.filename in (".", ".."):  # some servers list them, they are never files
+                    continue
                 path = posixpath.join(directory, entry.filename)
-                if stat.S_ISDIR(entry.st_mode or 0):
+                mode = entry.st_mode or 0
+                size, mtime = entry.st_size or 0, float(entry.st_mtime or 0)
+                if stat.S_ISLNK(mode):  # listdir_attr reports the link itself; look at what it points to
+                    try:
+                        target = self._sftp.stat(path)
+                    except IOError:
+                        continue  # broken link
+                    mode, size, mtime = target.st_mode or 0, target.st_size or 0, float(target.st_mtime or 0)
+                    if stat.S_ISDIR(mode):
+                        continue  # links to directories are not followed (could loop)
+                if stat.S_ISDIR(mode):
                     if recursive:
                         pending.append(path)
-                elif stat.S_ISREG(entry.st_mode or 0):
-                    found.append(FileInfo(entry.filename, path, entry.st_size or 0, float(entry.st_mtime or 0)))
+                elif stat.S_ISREG(mode):
+                    found.append(FileInfo(entry.filename, path, size, mtime))
         return found
 
     def stat(self, path: str) -> Optional[Tuple[int, float]]:
@@ -709,16 +722,34 @@ def run_transfer(cfg: Config, source, log: logging.Logger) -> Tuple[int, int]:
 # Notification and entry point
 # --------------------------------------------------------------------------
 
+def describe_run(cfg: Config) -> List[str]:
+    """Lines telling where the job ran: this machine, the SFTP server (if any), the job and its folders."""
+    if cfg.sftp:
+        transfer = f"SFTP from server {cfg.sftp_host}:{cfg.sftp_port} (user {cfg.sftp_user})"
+    else:
+        transfer = "local transfer"
+    return [
+        f"Script ran on server: {socket.getfqdn() or socket.gethostname()}",
+        f"Transfer: {transfer}",
+        f"Param file: {os.path.abspath(cfg.param_file)}",
+        f"Input dir: {cfg.input_dir}; Output dir: {', '.join(cfg.output_dirs)}",
+    ]
+
+
 def send_notification(cfg: Config, messages: List[str]) -> None:
     items = "<br>\n".join(html.escape(message) for message in messages)
+    where = "<br>\n".join(html.escape(line) for line in describe_run(cfg))
     body = (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Automatic File Transfer Notification</title>"
         "</head><body>Hi,<br>This is an automatic notification from file-transfer.py<br><br>"
+        f"{where}<br><br>"
         f"{items}<br><br>Please do not reply if not needed.<br>Cheers<br>file-transfer.py"
         f"<p style=\"font:7px arial,sans-serif\">v.{VERSION}</p></body></html>"
     )
     message = MIMEMultipart("mixed")
-    message["Subject"] = f"Automatic Mail from : File transfer with param {cfg.param_file}"
+    message["Subject"] = (
+        f"Automatic Mail from : File transfer with param {cfg.param_file} on {socket.getfqdn() or socket.gethostname()}"
+    )
     message["From"] = cfg.notification_sender
     message["To"] = ", ".join(cfg.notification_to)
     if cfg.notification_cc:
