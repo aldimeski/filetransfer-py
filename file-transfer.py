@@ -35,8 +35,11 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Dict, List, Optional, Set, Tuple
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 PARAM_SUFFIX = ".param"
+INI_NAME = "file-transfer.ini"
+NOTIFICATION_KEYS = ("Notification", "NotificationSender", "NotificationRe", "NotificationCc",
+                     "NotificationMethod", "NotificationServer", "NotificationPort")
 TMP_PREFIX = "tmp_"  # downstream readers must ignore files with this prefix
 RANGE_SEPARATOR = re.compile(r"&date", re.IGNORECASE)
 
@@ -208,6 +211,21 @@ def load_params(path: str) -> Dict[str, str]:
     return params
 
 
+def load_ini() -> Dict[str, str]:
+    """Default Notification* parameters from file-transfer.ini next to this script; {} if the file is absent."""
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), INI_NAME)
+    return load_params(path) if os.path.isfile(path) else {}
+
+
+def with_ini_defaults(params: Dict[str, str], ini: Dict[str, str]) -> Dict[str, str]:
+    """Notification* keys missing in the .param file are taken from the ini file; the .param file wins."""
+    merged = dict(params)
+    for key in NOTIFICATION_KEYS:
+        if key not in merged and key in ini:
+            merged[key] = ini[key]
+    return merged
+
+
 def _text(params: Dict[str, str], key: str, default: Optional[str] = None) -> str:
     value = params.get(key, "")
     if value == "":
@@ -226,6 +244,21 @@ def _flag(params: Dict[str, str], key: str, default: Optional[str] = None) -> bo
 
 def _split_list(value: str) -> List[str]:
     return [item.strip() for item in re.split(r"[,;]", value) if item.strip()]
+
+
+def notification_fields(params: Dict[str, str]) -> Tuple[str, List[str], List[str], str, int]:
+    """sender, recipients, cc, SMTP server and port, validated."""
+    method = _text(params, "NotificationMethod", "smtp").lower()
+    if method != "smtp":
+        raise ConfigError(f"NotificationMethod must be smtp, got '{method}'")
+    sender = _text(params, "NotificationSender")
+    recipients = _split_list(_text(params, "NotificationRe"))
+    cc = _split_list(_text(params, "NotificationCc", " ").strip())
+    server = _text(params, "NotificationServer")
+    port = int(_text(params, "NotificationPort", "25"))
+    if not recipients:
+        raise ConfigError("NotificationRe has no recipient")
+    return sender, recipients, cc, server, port
 
 
 @dataclass
@@ -333,16 +366,8 @@ class Config:
             cfg.log_file = _text(params, "LogFile")
 
         if cfg.notification:
-            method = _text(params, "NotificationMethod", "smtp").lower()
-            if method != "smtp":
-                raise ConfigError(f"NotificationMethod must be smtp, got '{method}'")
-            cfg.notification_sender = _text(params, "NotificationSender")
-            cfg.notification_to = _split_list(_text(params, "NotificationRe"))
-            cfg.notification_cc = _split_list(_text(params, "NotificationCc", " ").strip())
-            cfg.notification_server = _text(params, "NotificationServer")
-            cfg.notification_port = int(_text(params, "NotificationPort", "25"))
-            if not cfg.notification_to:
-                raise ConfigError("NotificationRe has no recipient")
+            (cfg.notification_sender, cfg.notification_to, cfg.notification_cc,
+             cfg.notification_server, cfg.notification_port) = notification_fields(params)
         return cfg
 
 
@@ -737,8 +762,32 @@ def describe_run(cfg: Config) -> List[str]:
 
 
 def send_notification(cfg: Config, messages: List[str]) -> None:
+    send_mail(cfg.notification_sender, cfg.notification_to, cfg.notification_cc,
+              cfg.notification_server, cfg.notification_port, cfg.param_file, describe_run(cfg), messages)
+
+
+def notify_missing_param_file(param_file: str, ini: Dict[str, str]) -> None:
+    """The .param file does not exist: only the ini defaults tell whom to mail."""
+    try:
+        if not _flag(ini, "Notification", "N"):
+            return
+        sender, recipients, cc, server, port = notification_fields(ini)
+    except ConfigError as exc:
+        print(f"Missing-file e-mail not sent, {INI_NAME}: {exc}", file=sys.stderr)
+        return
+    where = [
+        f"Script ran on server: {socket.getfqdn() or socket.gethostname()}",
+        f"Param file: {param_file}",
+        f"Time: {datetime.now():%Y-%m-%d %H:%M:%S}",
+    ]
+    send_mail(sender, recipients, cc, server, port, param_file, where,
+              [f"File {param_file} is not loaded, not a file, exiting..."])
+
+
+def send_mail(sender: str, recipients: List[str], cc: List[str], server: str, port: int,
+              param_file: str, where_lines: List[str], messages: List[str]) -> None:
     items = "<br>\n".join(html.escape(message) for message in messages)
-    where = "<br>\n".join(html.escape(line) for line in describe_run(cfg))
+    where = "<br>\n".join(html.escape(line) for line in where_lines)
     body = (
         "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>Automatic File Transfer Notification</title>"
         "</head><body>Hi,<br>This is an automatic notification from file-transfer.py<br><br>"
@@ -748,16 +797,16 @@ def send_notification(cfg: Config, messages: List[str]) -> None:
     )
     message = MIMEMultipart("mixed")
     message["Subject"] = (
-        f"Automatic Mail from : File transfer with param {cfg.param_file} on {socket.getfqdn() or socket.gethostname()}"
+        f"Automatic Mail from : File transfer with param {param_file} on {socket.getfqdn() or socket.gethostname()}"
     )
-    message["From"] = cfg.notification_sender
-    message["To"] = ", ".join(cfg.notification_to)
-    if cfg.notification_cc:
-        message["Cc"] = ", ".join(cfg.notification_cc)
+    message["From"] = sender
+    message["To"] = ", ".join(recipients)
+    if cc:
+        message["Cc"] = ", ".join(cc)
     message.attach(MIMEText(body, "html", "utf-8"))
     try:
-        with smtplib.SMTP(cfg.notification_server, cfg.notification_port, timeout=30) as smtp:
-            smtp.send_message(message, to_addrs=cfg.notification_to + cfg.notification_cc)
+        with smtplib.SMTP(server, port, timeout=30) as smtp:
+            smtp.send_message(message, to_addrs=recipients + cc)
     except (smtplib.SMTPException, OSError) as exc:
         print(f"Notification e-mail could not be sent: {exc}", file=sys.stderr)
 
@@ -789,6 +838,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1
     if not os.path.isfile(args.param_file):
         print(f"File {args.param_file} is not loaded, not a file!", file=sys.stderr)
+        try:
+            notify_missing_param_file(args.param_file, load_ini())
+        except (ConfigError, OSError) as exc:
+            print(f"Configuration error: {exc}", file=sys.stderr)
         return 1
     if not args.param_file.endswith(PARAM_SUFFIX):
         print(f"File {args.param_file} is not loaded, does not comply with {PARAM_SUFFIX} file type", file=sys.stderr)
@@ -796,7 +849,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     try:
         now = datetime.strptime(args.now, "%Y-%m-%d %H:%M:%S") if args.now else datetime.now()
-        cfg = Config.from_params(args.param_file, load_params(args.param_file), now)
+        params = with_ini_defaults(load_params(args.param_file), load_ini())
+        cfg = Config.from_params(args.param_file, params, now)
     except (ConfigError, ValueError, OSError) as exc:
         print(f"Configuration error: {exc}", file=sys.stderr)
         return 1

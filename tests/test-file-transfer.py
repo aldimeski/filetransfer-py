@@ -151,6 +151,7 @@ class JobTestCase(unittest.TestCase):
             "LogFile": "job.log", "Notification": "N", "FileDateCheck": "N",
         }
         params.update(overrides)
+        params = {key: value for key, value in params.items() if value is not None}  # None = leave the key out
         param_file = self.path("job.param")
         with open(param_file, "w") as handle:
             handle.write("".join(f"{key}:{value}\n" for key, value in params.items()))
@@ -489,6 +490,87 @@ class SftpTransferTests(JobTestCase):
         self.put("DR_P11_a.dat")
         self.assertEqual(self.sftp_job(SftpKey=self.path("missing")), 1)
         self.assertIn("SFTP key file not found", self.log_text())
+
+
+class IniDefaultsTests(JobTestCase):
+    """file-transfer.ini: default Notification* parameters."""
+
+    INI = {"Notification": "Y", "NotificationSender": "ini@x.at", "NotificationRe": "ops@x.at",
+           "NotificationCc": "cc@x.at", "NotificationMethod": "smtp", "NotificationServer": "smtp.ini"}
+
+    def use_ini(self, values):
+        self.addCleanup(setattr, ft, "load_ini", ft.load_ini)
+        ft.load_ini = lambda: dict(values)
+
+    def fake_smtp(self):
+        sent = []
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=None): sent.append(("connect", host, port))
+            def __enter__(self): return self
+            def __exit__(self, *args): return False
+            def send_message(self, message, to_addrs=None): sent.append(("mail", message["From"], to_addrs, message.as_string()))
+
+        original = ft.smtplib.SMTP
+        ft.smtplib.SMTP = FakeSMTP
+        self.addCleanup(setattr, ft.smtplib, "SMTP", original)
+        return sent
+
+    def run_main(self, argv):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            code = ft.main(argv)
+        self.err = err.getvalue()
+        return code
+
+    def test_missing_param_file_sends_mail_with_ini_values(self):
+        self.use_ini(self.INI)
+        sent = self.fake_smtp()
+        missing = self.path("nope.param")
+        self.assertEqual(self.run_main([missing]), 1)
+        self.assertEqual(sent[0], ("connect", "smtp.ini", 25))
+        self.assertEqual(sent[1][1:3], ("ini@x.at", ["ops@x.at", "cc@x.at"]))
+        self.assertIn(missing, sent[1][3])
+
+    def test_missing_param_file_no_mail_when_ini_says_n(self):
+        self.use_ini({**self.INI, "Notification": "N"})
+        sent = self.fake_smtp()
+        self.assertEqual(self.run_main([self.path("nope.param")]), 1)
+        self.assertEqual(sent, [])
+
+    def test_missing_param_file_without_ini_sends_nothing(self):
+        self.use_ini({})
+        sent = self.fake_smtp()
+        self.assertEqual(self.run_main([self.path("nope.param")]), 1)
+        self.assertEqual(sent, [])
+
+    def test_missing_param_file_incomplete_ini_is_reported_not_mailed(self):
+        self.use_ini({"Notification": "Y"})
+        sent = self.fake_smtp()
+        self.assertEqual(self.run_main([self.path("nope.param")]), 1)
+        self.assertEqual(sent, [])
+        self.assertIn("Missing parameter NotificationSender", self.err)
+
+    def test_no_argument_sends_nothing(self):
+        self.use_ini(self.INI)
+        sent = self.fake_smtp()
+        self.assertEqual(self.run_main([]), 1)
+        self.assertEqual(sent, [])
+
+    def test_param_file_uses_ini_for_missing_notification_keys(self):
+        self.use_ini(self.INI)
+        sent = self.fake_smtp()
+        # Notification itself is missing in the .param file too -> taken from the ini
+        code = self.run_job(InputDir=self.path("nope") + "/", Notification=None, NotificationRe="own@x.at")
+        self.assertEqual(code, 1)
+        self.assertEqual(sent[0], ("connect", "smtp.ini", 25))
+        self.assertEqual(sent[1][1:3], ("ini@x.at", ["own@x.at", "cc@x.at"]))  # .param value wins
+
+    def test_param_notification_n_beats_ini(self):
+        self.use_ini(self.INI)
+        sent = self.fake_smtp()
+        self.assertEqual(self.run_job(InputDir=self.path("nope") + "/", Notification="N"), 1)
+        self.assertEqual(sent, [])
 
 
 if __name__ == "__main__":

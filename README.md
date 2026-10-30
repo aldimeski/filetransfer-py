@@ -70,6 +70,20 @@ Format: `Name:value`, one per line, `#` starts a comment. Y/N values must be `Y`
 Optional extras: `SftpPort`, `SftpStrictHostKey`, `SizeCheckDelay`, `NotificationPort` (see `docs/architecture.md`).
 A complete example is in `examples/example-sftp.param`.
 
+### Default notification settings (`file-transfer.ini`)
+
+An optional `file-transfer.ini` next to `file-transfer.py` (same `key:value` format, `#` comments
+allowed) can hold `Notification`, `NotificationSender`, `NotificationRe`, `NotificationCc`,
+`NotificationMethod`, `NotificationServer` and `NotificationPort`. Entering only some of them is fine.
+
+- Every `Notification*` parameter missing in the `.param` file is taken from the ini file;
+  a value in the `.param` file always wins (also `Notification:N`).
+- If the `.param` file given as argument does not exist, an e-mail naming the file, the host and the
+  time is sent with the ini values (only with `Notification:Y` there). Exit code stays 1.
+- Without the ini file nothing changes. Started without an argument, no e-mail is sent.
+
+The folder holds an example `file-transfer.ini` (replace the example.com values).
+
 ## Date tokens in short
 
 ```

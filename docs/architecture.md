@@ -54,6 +54,9 @@ Only regular files are returned. `.` and `..` are ignored, directories are enter
 | `SizeCheckDelay` | 20 | seconds to wait for the size check |
 | `NotificationPort` | 25 | SMTP port |
 
+All `Notification*` keys can also come from `file-transfer.ini` (next to the script): keys missing in the
+`.param` file are filled from it, and it alone is used to mail about a missing `.param` file.
+
 Command line: `--check` (print expanded values and exit), `--now "YYYY-MM-DD HH:MM:SS"` (fake the current time).
 
 ## Exit codes
